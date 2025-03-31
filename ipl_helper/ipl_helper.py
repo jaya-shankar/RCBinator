@@ -7,6 +7,7 @@ import numpy as np
 import copy
 import math
 from datetime import datetime, timedelta
+from collections import deque
 
 from ipl_helper.cricbuzz_scraper import get_ipl_schedule, get_points_table, matches_played
 
@@ -16,8 +17,12 @@ FORM_WEIGHT = 0.3
 POINTS_WEIGHT = 0.6
 NRR_WEIGHT = 0.1
 
-# Team form data (updated dynamically)
+# Track the last n matches for each team
+RECENT_MATCHES_WINDOW = 3
+
+# Initialize form and track recent match results
 team_form = {team: 0.5 for team in ["CSK", "DC", "GT", "MI", "PBSK", "RR", "RCB", "SRH", "KKR", "LSG"]}
+recent_results = {team: deque(maxlen=RECENT_MATCHES_WINDOW) for team in ["CSK", "DC", "GT", "MI", "PBSK", "RR", "RCB", "SRH", "KKR", "LSG"]}
 
 # Head-to-head records (historical data - can be updated)
 head_to_head_advantage = {
@@ -66,10 +71,28 @@ def calculate_nrr_change(team_a, team_b, winner, T):
     return nrr_change
 
 
+def calculate_team_form(team):
+    """Calculate team form based on recent match results (wins/losses)"""
+    if not recent_results[team]:  # If no recent matches, return default form
+        return 0.5
+    
+    # Calculate form based on win/loss ratio in recent matches
+    wins = sum(1 for result in recent_results[team] if result == 'W')
+    form_value = wins / len(recent_results[team])
+    
+    # Scale to range 0.1 to 1.0
+    return max(0.1, min(1.0, 0.1 + 0.9 * form_value))
+
+
 def update_team_form(winner, loser):
-    """Update team form based on match results"""
-    team_form[winner] = min(1.0, team_form[winner] + 0.1)
-    team_form[loser] = max(0.1, team_form[loser] - 0.1)
+    """Update team form based on match results by recording recent match outcomes"""
+    # Record match results
+    recent_results[winner].append('W')  # Winner gets a Win
+    recent_results[loser].append('L')   # Loser gets a Loss
+    
+    # Recalculate form values based on recent results
+    team_form[winner] = calculate_team_form(winner)
+    team_form[loser] = calculate_team_form(loser)
 
 
 def IPL(team):
@@ -111,8 +134,11 @@ def MyTeam(team, T, matches_done, S, for_position, simulations=100_000):
         normalized_points = points / 28  # Normalize to 0-1 (max 28 points possible)
         normalized_nrr = (nrr + 1.5) / 3  # Normalize to 0-1 (simplified range)
         
+        # Get current form value based on recent matches
+        current_form = team_form[team_name]
+        
         # Fast calculation with fewer operations
-        strength = (POINTS_WEIGHT * normalized_points) + (NRR_WEIGHT * normalized_nrr) + (FORM_WEIGHT * team_form[team_name])
+        strength = (POINTS_WEIGHT * normalized_points) + (NRR_WEIGHT * normalized_nrr) + (FORM_WEIGHT * current_form)
         return max(0.1, min(1.0, strength))  # Clamp between 0.1 and 1.0
 
     def get_team_position(table, team_name):
@@ -121,6 +147,11 @@ def MyTeam(team, T, matches_done, S, for_position, simulations=100_000):
             if (t[0], t[1]) == (table[team_name][0], table[team_name][1]):
                 return pos
         return len(sorted_teams)
+    
+    # Reset recent results and form at the start of simulation
+    for t in team_form:
+        recent_results[t].clear()
+        team_form[t] = 0.5
     
     no_remaining = len(S)
 
@@ -158,6 +189,11 @@ def MyTeam(team, T, matches_done, S, for_position, simulations=100_000):
         example_tab = None
 
         for outcome in range(total_outcomes):
+            # Reset form for each complete tournament scenario
+            for t in team_form:
+                recent_results[t].clear()
+                team_form[t] = 0.5
+                
             temp_T = copy.deepcopy(T)
             scenario = []
             scenario_prob = 1.0  # Track probability of this outcome
@@ -167,13 +203,25 @@ def MyTeam(team, T, matches_done, S, for_position, simulations=100_000):
                 bit_pos = no_remaining - 1 - match_idx
                 result = (outcome >> bit_pos) & 1
                 
+                # Recalculate match probability using current form values
+                strength_a = calculate_strength(temp_T[team_a], team_a)
+                strength_b = calculate_strength(temp_T[team_b], team_b)
+                base_prob_a = strength_a / (strength_a + strength_b)
+                
+                # Apply head-to-head adjustment
+                h2h_modifier = 0
+                if team_a in head_to_head_advantage and team_b in head_to_head_advantage[team_a]:
+                    h2h_modifier = head_to_head_advantage[team_a][team_b] - 0.5
+                
+                match_prob = max(0.1, min(0.9, base_prob_a + h2h_modifier))
+                
                 # Update probability for this outcome
                 if result == 0:
-                    scenario_prob *= match_probs[match_idx]
+                    scenario_prob *= match_prob
                     winner = team_a
                     loser = team_b
                 else:
-                    scenario_prob *= (1 - match_probs[match_idx])
+                    scenario_prob *= (1 - match_prob)
                     winner = team_b
                     loser = team_a
                 
@@ -185,6 +233,9 @@ def MyTeam(team, T, matches_done, S, for_position, simulations=100_000):
                 temp_T[winner][1] += nrr_change
                 temp_T[loser][1] -= nrr_change
                 scenario.append(((team_a, team_b), winner))
+                
+                # Update team form based on this match result
+                update_team_form(winner, loser)
 
             # Check qualification
             sorted_teams = sorted(temp_T.values(), key=lambda x: (-x[0], -x[1]))
@@ -212,47 +263,71 @@ def MyTeam(team, T, matches_done, S, for_position, simulations=100_000):
         
         # Use optimized number of samples
         samples = min(simulations, 100_000)  # Cap samples for performance
+        
+        # Create arrays to track form and results for each team in each simulation
+        team_forms = np.full((samples, len(teams)), 0.5, dtype=np.float32)
+        
+        # We'll use a different approach for Monte Carlo to track recent results
+        # Instead of deques, we'll use a sliding window approach with fixed arrays
+        # This is more efficient for vectorized operations
+        
+        # Array to store the outcomes for later form calculation
+        match_winners = np.zeros((samples, num_matches), dtype=np.int32)
 
-        # Generate outcomes using precomputed probabilities
+        # Generate outcomes using precomputed probabilities initially
         outcomes = np.random.binomial(1, match_probs, size=(samples, num_matches))
 
         pt = np.tile(points, (samples, 1))
         pt[pt > 22] = 22  # Cap points
         nr = np.tile(nrr, (samples, 1))
 
-        # Optimized: Use vectorized operations for NRR changes
-        # Precompute 3 levels of NRR changes for all matches
-        nrr_changes_small = np.ones(samples) * 0.03
-        nrr_changes_medium = np.ones(samples) * 0.05
-        nrr_changes_large = np.ones(samples) * 0.08
-        
         # Process matches in batches for better performance
         for m_idx, (a, b) in enumerate(matches):
             team_a = teams[a]
             team_b = teams[b]
             
+            # Recalculate match probabilities based on current form
+            # We'll simplify this for performance, using the precomputed probabilities
+            # In a more accurate model, we would recalculate for each sample
+            
             a_wins = outcomes[:, m_idx].astype(bool)
             b_wins = ~a_wins
             
-            # Update points (vectorized operation)
+            # Update points
             pt[a_wins, a] += 2
             pt[b_wins, b] += 2
             
-            # Update NRR based on points difference (vectorized operation)
-            points_diff = np.abs(pt[a_wins, a] - pt[a_wins, b]) if np.any(a_wins) else 0
-            nrr_changes = np.zeros(samples)
+            # Update NRR (simplified)
+            nr[a_wins, a] += 0.05
+            nr[a_wins, b] -= 0.05
+            nr[b_wins, b] += 0.05
+            nr[b_wins, a] -= 0.05
             
-            # For team A wins - using mask operations for vectorized approach
-            if np.any(a_wins):
-                # Update NRR for team A wins (vectorized)
-                nr[a_wins, a] += 0.05  # Use standard NRR change for simplicity
-                nr[a_wins, b] -= 0.05
+            # Record match winners for form calculation
+            match_winners[a_wins, m_idx] = a
+            match_winners[b_wins, m_idx] = b
             
-            # For team B wins - using mask operations for vectorized approach
-            if np.any(b_wins):
-                # Update NRR for team B wins (vectorized)
-                nr[b_wins, b] += 0.05  # Use standard NRR change for simplicity
-                nr[b_wins, a] -= 0.05
+            # Update form based on the last RECENT_MATCHES_WINDOW matches
+            if m_idx >= RECENT_MATCHES_WINDOW:
+                # Look back at the last few matches for each team
+                for sim in range(samples):
+                    for t_idx in range(len(teams)):
+                        # Count recent wins for this team
+                        recent_win_count = 0
+                        recent_match_count = 0
+                        
+                        # Check the last few matches involving this team
+                        for prev_m_idx in range(max(0, m_idx - RECENT_MATCHES_WINDOW), m_idx):
+                            prev_match = matches[prev_m_idx]
+                            if t_idx in prev_match:  # If this team played in this match
+                                recent_match_count += 1
+                                if match_winners[sim, prev_m_idx] == t_idx:  # If this team won
+                                    recent_win_count += 1
+                        
+                        # Update form if team played any recent matches
+                        if recent_match_count > 0:
+                            win_ratio = recent_win_count / recent_match_count
+                            team_forms[sim, t_idx] = max(0.1, min(1.0, 0.1 + 0.9 * win_ratio))
 
         # Calculate rankings with weighted points/NRR (points dominate)
         composite = pt * 1000 + nr  # Points dominate by 1000:1 ratio
@@ -268,6 +343,11 @@ def MyTeam(team, T, matches_done, S, for_position, simulations=100_000):
             pt_ex = points.copy()
             nr_ex = nrr.copy()
             scenario = []
+            
+            # Reset form tracking for the example scenario
+            for t in team_form:
+                recent_results[t].clear()
+                team_form[t] = 0.5
             
             for m_idx, (a, b) in enumerate(matches):
                 result = outcomes[idx, m_idx]
