@@ -11,7 +11,7 @@ def get_ipl_page_url():
     series_url = base_url + "/cricket-series"
     response = requests.get(series_url)
     soup = BeautifulSoup(response.text, 'html.parser')
-    ipl_page_url = soup.find('a', title='Indian Premier League 2025')['href']
+    ipl_page_url = soup.find('a', title='Indian Premier League 2026')['href']
     if not ipl_page_url:
         return None
     ipl_page_url = base_url + ipl_page_url
